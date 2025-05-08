@@ -214,6 +214,10 @@ def transcribe(
     fp32: Annotated[
         bool, typer.Option("--fp32/--bf16", help="Use FP32 precision")
     ] = False,
+    to_stdout: Annotated[
+        bool,
+        typer.Option("--to-stdout", help="Print transcription to stdout (best for 'txt' format) instead of writing a file."),
+    ] = False,
 ):
     """
     Transcribe audio files using Parakeet MLX models.
@@ -229,17 +233,21 @@ def transcribe(
         print(f"[bold red]Error loading model {model}:[/bold red] {e}")
         raise typer.Exit(code=1)
 
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        print(f"[bold red]Error creating output directory {output_dir}:[/bold red] {e}")
-        raise typer.Exit(code=1)
+    if not (to_stdout and output_format.lower() == "txt"): # Only skip dir creation if ONLY txt output is going to stdout
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[bold red]Error creating output directory {output_dir}:[/bold red] {e}")
+            raise typer.Exit(code=1)
 
     if verbose:
         print(f"Output directory: [bold cyan]{output_dir.resolve()}[/bold cyan]")
         print(f"Output format(s): [bold cyan]{output_format}[/bold cyan]")
         if output_format in ["srt", "vtt", "all"] and highlight_words:
             print("Highlight words: [bold cyan]Enabled[/bold cyan]")
+        if to_stdout:
+            print("Output to stdout: [bold cyan]Enabled[/bold cyan] (primarily for 'txt' format)")
+
 
     formatters = {
         "txt": to_txt,
@@ -269,36 +277,46 @@ def transcribe(
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TimeElapsedColumn(),
-        transient=True,
+        transient=True if not verbose else False, # Keep progress if verbose for easier log reading
     ) as progress:
-        task = progress.add_task("Transcribing...", total=total_files)
+        main_task_id = progress.add_task("Overall Progress...", total=total_files)
 
         for i, audio_path in enumerate(audios):
-            if verbose:
-                print(
-                    f"\nProcessing file {i + 1}/{total_files}: [bold cyan]{audio_path.name}[/bold cyan]"
-                )
-            else:
-                progress.update(
-                    task, description=f"Processing [cyan]{audio_path.name}[/cyan]..."
-                )
+            progress.update(main_task_id, description=f"Processing [cyan]{audio_path.name}[/cyan] ({i+1}/{total_files})")
+
+            chunk_processing_task_id = None # For nested progress bar for chunks
+
+            def chunk_callback_for_progress(current_chunk_pos, total_chunk_audio_len):
+                nonlocal chunk_processing_task_id
+                if chunk_processing_task_id is None:
+                     # Task description includes audio file name for clarity if multiple files run in verbose
+                    task_description = f"Chunking [magenta]{audio_path.name}[/magenta]"
+                    chunk_processing_task_id = progress.add_task(task_description, total=total_chunk_audio_len)
+                progress.update(chunk_processing_task_id, completed=current_chunk_pos)
+
 
             try:
                 result: AlignedResult = loaded_model.transcribe(
-                    audio_path,
+                    str(audio_path), # Ensure path is string for older audiofile versions
                     dtype=bfloat16 if not fp32 else float32,
                     chunk_duration=chunk_duration if chunk_duration != 0 else None,
                     overlap_duration=overlap_duration,
-                    chunk_callback=lambda current, full: progress.update(
-                        task, total=total_files * full, completed=full * i + current
-                    ),
+                    chunk_callback=chunk_callback_for_progress if not verbose else None, # Use rich progress for chunking if not verbose
                 )
 
-                if verbose:
+                if chunk_processing_task_id is not None: # Remove chunk task after it's done
+                    progress.remove_task(chunk_processing_task_id)
+
+
+                # Suppress per-sentence verbose output if --to-stdout is used for 'txt'
+                # to avoid mixing with the final clean stdout output.
+                if verbose and not (to_stdout and "txt" in formats_to_generate):
+                    print(f"\n[bold]Transcription for {audio_path.name}:[/bold]")
                     for sentence in result.sentences:
                         start, end, text = sentence.start, sentence.end, sentence.text
                         line = f"[blue][{format_timestamp(start)} --> {format_timestamp(end)}][/blue] {text.strip()}"
                         print(line)
+                    print("") # Add a newline after per-sentence output
 
                 base_filename = audio_path.stem
                 template_vars = {
@@ -306,12 +324,22 @@ def transcribe(
                     "date": datetime.datetime.now().strftime("%Y%m%d"),
                     "index": str(i + 1),
                 }
-
                 output_basename = output_template.format(**template_vars)
 
                 for fmt in formats_to_generate:
                     formatter = formatters[fmt]
                     output_content = formatter(result)
+
+                    if to_stdout and fmt == "txt":
+                        # Use regular print for stdout to avoid rich console markup issues if piped
+                        import sys
+                        sys.stdout.write(output_content + "\n")
+                        sys.stdout.flush()
+                        if verbose:
+                            # Use rich.print for console messages
+                            print(f"[green]Printed '{fmt.upper()}' output to stdout for {audio_path.name}.[/green]")
+                        continue # Skip file writing for 'txt' format if it went to stdout
+
                     output_filename = f"{output_basename}.{fmt}"
                     output_filepath = output_dir / output_filename
 
@@ -320,21 +348,33 @@ def transcribe(
                             f.write(output_content)
                         if verbose:
                             print(
-                                f"[green]Saved {fmt.upper()}:[/green] {output_filepath.absolute()}"
+                                f"[green]Saved {fmt.upper()}:[/green] {output_filepath.resolve()}"
                             )
                     except Exception as e:
                         print(
                             f"[bold red]Error writing output file {output_filepath}:[/bold red] {e}"
                         )
-
             except Exception as e:
+                if chunk_processing_task_id is not None:
+                    progress.remove_task(chunk_processing_task_id)
                 print(f"[bold red]Error transcribing file {audio_path}:[/bold red] {e}")
+                # Optionally: raise e # if you want to halt on first error
 
-            progress.update(task, total=total_files, completed=i + 1)
+            progress.update(main_task_id, advance=1)
 
-    print(
-        f"\n[bold green]Transcription complete.[/bold green] Outputs saved in '{output_dir.resolve()}'."
-    )
+
+    # Final message
+    if to_stdout and "txt" in formats_to_generate and len(formats_to_generate) == 1 and total_files == 1:
+        # If only one txt file was processed to stdout, the "Transcription complete" message might be redundant
+        # or could be tailored. For now, we'll keep it.
+        pass
+
+    if not (to_stdout and output_format.lower() == "txt" and len(formats_to_generate) ==1 ):
+         print(
+            f"\n[bold green]Transcription complete.[/bold green] Outputs saved in '{output_dir.resolve()}' (unless printed to stdout)."
+        )
+    elif verbose : # if it was to_stdout and txt only
+        print(f"\n[bold green]Transcription to stdout complete.[/bold green]")
 
 
 if __name__ == "__main__":
